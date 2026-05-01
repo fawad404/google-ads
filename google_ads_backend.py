@@ -25,6 +25,38 @@ app = Flask(__name__)
 
 CORS(app)
 
+# Bearer-token gate. The Render worker has no other auth surface, so leaving
+# it open lets anyone with the URL mutate the MCC. The companion Supabase
+# edge function (`render-worker-proxy`) sends `Authorization: Bearer ${WORKER_API_KEY}`.
+#
+# Roll-out behavior:
+#   * If WORKER_API_KEY is unset, the gate falls open and logs a warning so
+#     the existing dashboard keeps working during the deploy/rotate window.
+#   * Once the env var is set in Render and matches the value in Supabase
+#     secrets, the gate enforces. There is no "in-between" state: either
+#     side requires the key or it doesn't.
+WORKER_API_KEY = os.environ.get("WORKER_API_KEY", "").strip()
+
+
+@app.before_request
+def _require_api_key():
+    if request.method == "OPTIONS":
+        return None
+    if not WORKER_API_KEY:
+        app.logger.warning(
+            "[SECURITY] WORKER_API_KEY not set — allowing %s %s",
+            request.method,
+            request.path,
+        )
+        return None
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        return jsonify({"error": "Unauthorized"}), 401
+    token = auth[len("Bearer "):].strip()
+    if token != WORKER_API_KEY:
+        return jsonify({"error": "Unauthorized"}), 401
+    return None
+
 def load_leptage_config() -> None:
     """
     Load config/leptage.yaml into app.config["LEPTAGE_CONFIG"].
