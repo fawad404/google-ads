@@ -1705,6 +1705,14 @@ def client_spend_status():
     if not customer_id or not customer_id.isdigit():
         return jsonify({"success": False, "errors": ["Valid numeric customer_id is required."]}), 400
 
+    # `granularity=daily` adds a per-day breakdown to the response so the
+    # dashboard can render daily-bar charts that match the lifetime/total
+    # spend number. Default behaviour (no granularity, or granularity=total)
+    # is unchanged: a single rolled-up `total_spend`.
+    granularity = request.args.get('granularity', 'total').strip().lower()
+    if granularity not in ('total', 'daily'):
+        granularity = 'total'
+
     # Optional date range. We validate strictly to YYYY-MM-DD and reject
     # anything else so the literal can't be abused inside the GAQL query.
     from_date_raw = request.args.get('from', '').strip()
@@ -1745,12 +1753,31 @@ def client_spend_status():
                 break
 
             # 1b) Spend metrics, optionally scoped to the requested window.
-            # When segments.date is present in the WHERE clause, GAQL
-            # returns one row per day, so we sum across rows.
-            metrics_query = "SELECT metrics.cost_micros FROM customer" + date_filter_clause
+            # When segments.date is present (either via WHERE clause or
+            # SELECT for daily granularity), GAQL returns one row per day,
+            # so we sum across rows for the total and also collect the
+            # per-day rows when the caller asked for granularity=daily.
+            if granularity == 'daily':
+                # SELECT segments.date so each row is one day. WHERE clause
+                # still applies — GAQL requires segments.date in either the
+                # SELECT or the WHERE for date-bound aggregation.
+                metrics_query = (
+                    "SELECT segments.date, metrics.cost_micros FROM customer"
+                    + date_filter_clause
+                )
+            else:
+                metrics_query = "SELECT metrics.cost_micros FROM customer" + date_filter_clause
             total_spend_micros = 0
+            daily_rows = []  # only populated when granularity='daily'
             for row in ga_service.search(customer_id=customer_id, query=metrics_query):
-                total_spend_micros += row.metrics.cost_micros
+                cost = row.metrics.cost_micros
+                total_spend_micros += cost
+                if granularity == 'daily':
+                    daily_rows.append({
+                        "date": row.segments.date,
+                        "cost_micros": cost,
+                        "cost": cost / 1e6,
+                    })
 
             # 2) Fetch current account budget limit (hard cap)
             budget_query = """
@@ -1788,6 +1815,10 @@ def client_spend_status():
                 "remaining_balance_micros": remaining_balance_micros,
                 "percentage_used": round(percentage_used, 2),
                 "period": period_used,
+                "granularity": granularity,
+                # Only set when granularity=daily; total responses omit
+                # the field so the payload shape stays familiar.
+                **({"daily": daily_rows} if granularity == 'daily' else {}),
                 "timestamp": datetime.utcnow().isoformat() + "Z"
             }), 200
 
