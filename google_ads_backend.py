@@ -1686,32 +1686,71 @@ def check_and_pause_campaigns():
 
 @app.route('/client-spend-status', methods=['GET'])
 def client_spend_status():
-    """GET /client-spend-status?customer_id=XXXX - Return real-time spend and balance."""
+    """GET /client-spend-status?customer_id=XXXX[&from=YYYY-MM-DD&to=YYYY-MM-DD]
+    Return real-time spend and balance.
+
+    `from` / `to` are optional. When both are provided and parse as
+    YYYY-MM-DD, the spend metric is restricted to that window via
+    `WHERE segments.date BETWEEN ...`. When omitted (or invalid), the
+    response falls back to lifetime spend (the original behaviour),
+    so any caller that doesn't pass the params keeps working.
+
+    The `topup_amount` (account budget hard cap) and `remaining_balance`
+    are intentionally still lifetime values — the budget cap is a
+    present-time number, not a per-period sum, so date-scoping it
+    would be misleading.
+    """
     customer_id = request.args.get('customer_id', '').strip()
 
     if not customer_id or not customer_id.isdigit():
         return jsonify({"success": False, "errors": ["Valid numeric customer_id is required."]}), 400
+
+    # Optional date range. We validate strictly to YYYY-MM-DD and reject
+    # anything else so the literal can't be abused inside the GAQL query.
+    from_date_raw = request.args.get('from', '').strip()
+    to_date_raw = request.args.get('to', '').strip()
+    date_filter_clause = ""
+    period_used = "lifetime"
+    if from_date_raw and to_date_raw:
+        try:
+            from_dt = datetime.strptime(from_date_raw, '%Y-%m-%d')
+            to_dt = datetime.strptime(to_date_raw, '%Y-%m-%d')
+            if to_dt < from_dt:
+                return jsonify({"success": False, "errors": ["'to' must be on or after 'from'."]}), 400
+            # Re-format to canonical ISO so the GAQL WHERE clause only
+            # ever sees clean values we just parsed ourselves.
+            date_filter_clause = (
+                f" WHERE segments.date BETWEEN '{from_dt.strftime('%Y-%m-%d')}' "
+                f"AND '{to_dt.strftime('%Y-%m-%d')}'"
+            )
+            period_used = f"{from_dt.strftime('%Y-%m-%d')}..{to_dt.strftime('%Y-%m-%d')}"
+        except ValueError:
+            # Invalid format — silently fall back to lifetime so the
+            # caller still gets numbers instead of a 400.
+            date_filter_clause = ""
+            period_used = "lifetime"
 
     for attempt in range(3):
         try:
             client, _ = load_google_ads_client()
             ga_service = client.get_service("GoogleAdsService")
 
-            # 1) Fetch spend metrics
-            metrics_query = """
-                SELECT
-                    customer.currency_code,
-                    metrics.cost_micros
-                FROM customer
-            """
-            metrics_response = ga_service.search(customer_id=customer_id, query=metrics_query)
-
-            total_spend_micros = 0
+            # 1a) Currency (always lifetime — currency_code doesn't depend
+            # on a date window and segments.date isn't compatible with the
+            # currency-only customer query).
+            currency_query = "SELECT customer.currency_code FROM customer"
             currency = "USD"
-            for row in metrics_response:
-                total_spend_micros = row.metrics.cost_micros
+            for row in ga_service.search(customer_id=customer_id, query=currency_query):
                 currency = row.customer.currency_code
                 break
+
+            # 1b) Spend metrics, optionally scoped to the requested window.
+            # When segments.date is present in the WHERE clause, GAQL
+            # returns one row per day, so we sum across rows.
+            metrics_query = "SELECT metrics.cost_micros FROM customer" + date_filter_clause
+            total_spend_micros = 0
+            for row in ga_service.search(customer_id=customer_id, query=metrics_query):
+                total_spend_micros += row.metrics.cost_micros
 
             # 2) Fetch current account budget limit (hard cap)
             budget_query = """
@@ -1748,6 +1787,7 @@ def client_spend_status():
                 "remaining_balance": remaining_balance_micros / 1e6,
                 "remaining_balance_micros": remaining_balance_micros,
                 "percentage_used": round(percentage_used, 2),
+                "period": period_used,
                 "timestamp": datetime.utcnow().isoformat() + "Z"
             }), 200
 
